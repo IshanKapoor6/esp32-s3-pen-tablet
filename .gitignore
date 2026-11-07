@@ -1,0 +1,6 @@
+/build_fresh/
+*.bin
+*.elf
+*.map
+.DS_Store
+Thumbs.db

@@ -12,9 +12,13 @@ using namespace esp_panel::board;
 static constexpr uint16_t TOUCH_POLL_MS = 8;
 static constexpr uint16_t TOUCH_UI_REFRESH_MS = 33;
 static constexpr uint16_t TOUCH_RELEASE_DEBOUNCE_MS = 40;
+static constexpr uint8_t TOUCH_MAX_POINTS = 5;
 static constexpr uint8_t TOUCH_DEADZONE_PX = 1;
 static constexpr uint8_t CLICK_SLOP_PX = 8;
-static constexpr int8_t POINTER_SENSITIVITY = 2;
+static constexpr int8_t POINTER_SENSITIVITY = 3;
+static constexpr uint16_t FINGER_AREA_RATIO = 2;
+static constexpr uint16_t FINGER_AREA_MARGIN = 12;
+static constexpr uint8_t MULTITOUCH_REBASE_DELTA_PX = 48;
 static constexpr int16_t LCD_WIDTH = 800;
 static constexpr int16_t LCD_HEIGHT = 480;
 
@@ -24,10 +28,12 @@ lv_obj_t *statusLabel = nullptr;
 lv_obj_t *touchDot = nullptr;
 bool touchActive = false;
 bool touchMoved = false;
+bool multipleContactsSeen = false;
 int16_t touchStartX = 0;
 int16_t touchStartY = 0;
 int16_t lastTouchX = 0;
 int16_t lastTouchY = 0;
+uint16_t activeContactArea = 0;
 uint32_t lastTouchPollMs = 0;
 uint32_t lastTouchUiMs = 0;
 uint32_t neutralReportsUntilMs = 0;
@@ -42,13 +48,13 @@ static int8_t scaleDelta(int32_t delta)
     return static_cast<int8_t>(scaled);
 }
 
-static void setTouchDisplay(bool touched, int16_t x = 0, int16_t y = 0)
+static void setTouchDisplay(bool touched, int16_t x = 0, int16_t y = 0, int count = 0, int area = 0)
 {
     if (statusLabel == nullptr || touchDot == nullptr) return;
     if (!lvgl_port_lock(1000)) return;
 
     if (touched) {
-        lv_label_set_text_fmt(statusLabel, "TOUCH DETECTED\nX: %d    Y: %d", x, y);
+        lv_label_set_text_fmt(statusLabel, "TRACKING TOUCH\nX: %d    Y: %d\nContacts: %d  Area: %d", x, y, count, area);
         const int16_t dotX = constrain(static_cast<int>(x) - 16, 0, LCD_WIDTH - 32);
         const int16_t dotY = constrain(static_cast<int>(y) - 16, 0, LCD_HEIGHT - 32);
         lv_obj_set_pos(touchDot, dotX, dotY);
@@ -94,22 +100,71 @@ static void createTabletUi()
     lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void beginTouch(const TouchPoint &point)
+// GT911 has no pen identity. On multi-touch frames, prefer the point with the
+// smallest reported contact area, which is usually the narrow capacitive tip.
+static bool selectPointerContact(const TouchPoint points[], int count, TouchPoint &selected)
+{
+    if (count <= 0) return false;
+
+    int bestIndex = 0;
+    for (int i = 1; i < count; ++i) {
+        if (points[i].strength > 0 &&
+            (points[bestIndex].strength <= 0 || points[i].strength < points[bestIndex].strength)) {
+            bestIndex = i;
+        }
+    }
+
+    selected = points[bestIndex];
+    if (count > 1) {
+        multipleContactsSeen = true;
+        if (selected.strength > 0 &&
+            (activeContactArea == 0 || selected.strength < activeContactArea)) {
+            activeContactArea = selected.strength;
+        }
+        return true;
+    }
+
+    // If multiple contacts were present and only a much larger point remains,
+    // treat it as the resting finger after the smaller stylus contact lifted.
+    if (multipleContactsSeen && activeContactArea > 0 && selected.strength > 0 &&
+        selected.strength > activeContactArea * FINGER_AREA_RATIO + FINGER_AREA_MARGIN) {
+        return false;
+    }
+
+    if (selected.strength > 0 &&
+        (activeContactArea == 0 || selected.strength < activeContactArea)) {
+        activeContactArea = selected.strength;
+    }
+    return true;
+}
+
+static void beginTouch(const TouchPoint &point, int pointCount)
 {
     touchActive = true;
     touchMoved = false;
     touchReleasePending = false;
     touchStartX = lastTouchX = point.x;
     touchStartY = lastTouchY = point.y;
-    setTouchDisplay(true, point.x, point.y);
+    setTouchDisplay(true, point.x, point.y, pointCount, point.strength);
     lastTouchUiMs = millis();
-    Serial.printf("Touch down: %d,%d\n", point.x, point.y);
+    Serial.printf("Touch down: %d,%d area=%d points=%d\n", point.x, point.y, point.strength, pointCount);
 }
 
-static void updateTouch(const TouchPoint &point)
+static void updateTouch(const TouchPoint &point, int pointCount, bool rebase)
 {
     int32_t dx = static_cast<int32_t>(point.x) - lastTouchX;
     int32_t dy = static_cast<int32_t>(point.y) - lastTouchY;
+
+    // When a second contact appears, the smallest-area point may be the stylus
+    // while the previous point was a finger. Rebase instead of jumping across
+    // the distance between the two contacts.
+    if (rebase) {
+        lastTouchX = touchStartX = point.x;
+        lastTouchY = touchStartY = point.y;
+        touchMoved = false;
+        return;
+    }
+
     lastTouchX = point.x;
     lastTouchY = point.y;
     // The diagnostic label and dot are only for visual feedback. Updating
@@ -117,7 +172,7 @@ static void updateTouch(const TouchPoint &point)
     // competes with timely USB mouse reports.
     const uint32_t now = millis();
     if (now - lastTouchUiMs >= TOUCH_UI_REFRESH_MS) {
-        setTouchDisplay(true, point.x, point.y);
+        setTouchDisplay(true, point.x, point.y, pointCount, point.strength);
         lastTouchUiMs = now;
     }
 
@@ -217,14 +272,18 @@ void loop()
         tabletMouse.move(0, 0);
     }
 
+    TouchPoint points[TOUCH_MAX_POINTS];
+    const int count = board->getTouch()->readPoints(points, TOUCH_MAX_POINTS, 0);
     TouchPoint point;
-    const int count = board->getTouch()->readPoints(&point, 1, 0);
-    if (count > 0) {
+    const bool hasPointerContact = selectPointerContact(points, count, point);
+    if (hasPointerContact) {
         touchReleasePending = false;
         if (!touchActive) {
-            beginTouch(point);
+            beginTouch(point, count);
         } else {
-            updateTouch(point);
+            const bool rebase = count > 1 && abs(static_cast<int>(point.x) - lastTouchX) +
+                abs(static_cast<int>(point.y) - lastTouchY) > MULTITOUCH_REBASE_DELTA_PX;
+            updateTouch(point, count, rebase);
         }
     } else if (touchActive) {
         // The controller reports at about 100 Hz, while this loop polls at
@@ -237,5 +296,8 @@ void loop()
             touchReleasePending = false;
             endTouch();
         }
+    } else if (count == 0) {
+        multipleContactsSeen = false;
+        activeContactArea = 0;
     }
 }

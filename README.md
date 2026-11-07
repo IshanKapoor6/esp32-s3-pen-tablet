@@ -12,7 +12,11 @@ The display shows a dark diagnostic screen. It says **WAITING FOR TOUCH** until 
 - Tap without moving to click.
 - Swipes only move the pointer; dragging is disabled for now.
 - Touch release is debounced to prevent brief gaps in touch reports from generating repeated clicks.
+- Sensitivity is set to 3x the raw touch movement.
+- With multiple contacts, the smallest reported GT911 contact area is used as a stylus proxy; much larger remaining contacts are ignored until all contacts lift.
 - A finger or capacitive stylus works. Passive plastic pens do not. No pressure or tilt data is available.
+
+The GT911 does not identify an active pen separately from a finger. Multi-touch rejection is therefore an area-size heuristic: a broad-tipped capacitive stylus may not separate cleanly from fingers, and a single finger touch is accepted as normal input.
 
 ## Hardware
 

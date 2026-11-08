@@ -24,7 +24,9 @@ static constexpr uint16_t MODE_GESTURE_HOLD_MS = 650;
 static constexpr int16_t LCD_WIDTH = 800;
 static constexpr int16_t LCD_HEIGHT = 480;
 static constexpr uint32_t GAMEPAD_BUTTON_MASK = (1UL << BUTTON_A) | (1UL << BUTTON_B) |
-    (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_SELECT) | (1UL << BUTTON_START);
+    (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_TL) | (1UL << BUTTON_TR) |
+    (1UL << BUTTON_SELECT) | (1UL << BUTTON_START) | (1UL << BUTTON_THUMBL) |
+    (1UL << BUTTON_THUMBR);
 
 USBHIDMouse tabletMouse;
 USBHIDGamepad tabletGamepad;
@@ -52,9 +54,17 @@ bool touchReleasePending = false;
 uint32_t gamepadButtons = 0;
 int8_t gamepadX = 0;
 int8_t gamepadY = 0;
+int8_t gamepadZ = 0;
+int8_t gamepadRz = 0;
+int8_t gamepadLeftTrigger = 0;
+int8_t gamepadRightTrigger = 0;
+uint8_t gamepadHat = HAT_CENTER;
+bool gamepadReleasePending = false;
+uint32_t gamepadNoPointSinceMs = 0;
 bool modeGesturePending = false;
 bool modeGestureLatched = false;
 uint32_t modeGestureStartMs = 0;
+uint32_t modeGestureLastSeenMs = 0;
 bool modeGestureReleasePending = false;
 uint32_t modeGestureNoPointSinceMs = 0;
 uint32_t lastGestureUiMs = 0;
@@ -127,40 +137,44 @@ static void createTabletUi()
     lv_obj_set_style_text_color(gamepadTitle, lv_color_hex(0xF3F4F6), LV_PART_MAIN);
     lv_obj_align(gamepadTitle, LV_ALIGN_TOP_MID, 0, 22);
     gamepadGestureLabel = lv_label_create(gamepadScreen);
-    lv_label_set_text(gamepadGestureLabel, "Touch the left side for stick, right side for buttons");
+    lv_label_set_text(gamepadGestureLabel, "Touch controls to answer Steam setup prompts");
     lv_obj_set_style_text_color(gamepadGestureLabel, lv_color_hex(0x67E8F9), LV_PART_MAIN);
     lv_obj_align(gamepadGestureLabel, LV_ALIGN_TOP_MID, 0, 58);
 
-    lv_obj_t *stick = lv_obj_create(gamepadScreen);
-    lv_obj_set_size(stick, 220, 220);
-    lv_obj_set_style_radius(stick, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(stick, lv_color_hex(0x263449), LV_PART_MAIN);
-    lv_obj_set_style_border_color(stick, lv_color_hex(0x67E8F9), LV_PART_MAIN);
-    lv_obj_align(stick, LV_ALIGN_LEFT_MID, 50, 24);
-    lv_obj_t *stickLabel = lv_label_create(gamepadScreen);
-    lv_label_set_text(stickLabel, "LEFT STICK");
-    lv_obj_set_style_text_color(stickLabel, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
-    lv_obj_align_to(stickLabel, stick, LV_ALIGN_CENTER, 0, 0);
-
-    const char *buttonNames[] = {"Y", "X", "B", "A"};
-    const uint32_t buttonColors[] = {0x3B82F6, 0x10B981, 0xF59E0B, 0xEF4444};
-    const int16_t buttonX[] = {635, 705, 635, 705};
-    const int16_t buttonY[] = {145, 215, 285, 355};
-    for (int i = 0; i < 4; ++i) {
-        lv_obj_t *button = lv_obj_create(gamepadScreen);
-        lv_obj_set_size(button, 58, 58);
-        lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(button, lv_color_hex(buttonColors[i]), LV_PART_MAIN);
-        lv_obj_set_style_border_width(button, 0, LV_PART_MAIN);
-        lv_obj_set_pos(button, buttonX[i], buttonY[i]);
-        lv_obj_t *label = lv_label_create(button);
-        lv_label_set_text(label, buttonNames[i]);
+    const auto addControl = [](const char *name, int x, int y, int width, int height, uint32_t color, bool round) {
+        lv_obj_t *control = lv_obj_create(gamepadScreen);
+        lv_obj_set_size(control, width, height);
+        lv_obj_set_style_radius(control, round ? LV_RADIUS_CIRCLE : 12, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(control, lv_color_hex(color), LV_PART_MAIN);
+        lv_obj_set_style_border_color(control, lv_color_hex(0x64748B), LV_PART_MAIN);
+        lv_obj_set_style_border_width(control, 1, LV_PART_MAIN);
+        lv_obj_set_pos(control, x, y);
+        lv_obj_t *label = lv_label_create(control);
+        lv_label_set_text(label, name);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xF8FAFC), LV_PART_MAIN);
         lv_obj_center(label);
-    }
-    lv_obj_t *systemLabel = lv_label_create(gamepadScreen);
-    lv_label_set_text(systemLabel, "SELECT                         START");
-    lv_obj_set_style_text_color(systemLabel, lv_color_hex(0xD1D5DB), LV_PART_MAIN);
-    lv_obj_align(systemLabel, LV_ALIGN_BOTTOM_MID, 0, -24);
+    };
+
+    // Standard landscape gamepad layout. The touch hit regions below match
+    // these screen controls so Steam's setup prompts can be answered directly.
+    addControl("LT", 35, 76, 105, 42, 0x334155, false);
+    addControl("LB", 146, 76, 105, 42, 0x475569, false);
+    addControl("SELECT", 310, 76, 82, 42, 0x334155, false);
+    addControl("START", 408, 76, 82, 42, 0x334155, false);
+    addControl("RB", 549, 76, 105, 42, 0x475569, false);
+    addControl("RT", 660, 76, 105, 42, 0x334155, false);
+
+    addControl("L STICK", 55, 226, 174, 174, 0x263449, true);
+    addControl("UP", 304, 216, 52, 44, 0x334155, true);
+    addControl("LEFT", 250, 270, 52, 44, 0x334155, true);
+    addControl("DOWN", 304, 324, 52, 44, 0x334155, true);
+    addControl("RIGHT", 358, 270, 52, 44, 0x334155, true);
+    addControl("R STICK", 432, 226, 174, 174, 0x263449, true);
+
+    addControl("Y", 678, 216, 54, 54, 0x3B82F6, true);
+    addControl("X", 618, 276, 54, 54, 0x10B981, true);
+    addControl("B", 738, 276, 54, 54, 0xF59E0B, true);
+    addControl("A", 678, 336, 54, 54, 0xEF4444, true);
 }
 
 static void setGestureDisplay(int count, uint32_t heldMs)
@@ -193,6 +207,10 @@ static void setMode(InputMode mode)
     activeContactArea = 0;
     gamepadButtons = 0;
     gamepadX = gamepadY = 0;
+    gamepadZ = gamepadRz = 0;
+    gamepadLeftTrigger = gamepadRightTrigger = 0;
+    gamepadHat = HAT_CENTER;
+    gamepadReleasePending = false;
     tabletMouse.release(MOUSE_LEFT);
     tabletMouse.move(0, 0);
     tabletGamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, 0);
@@ -205,31 +223,69 @@ static void setMode(InputMode mode)
 
 static void updateGamepad(const TouchPoint points[], int count)
 {
-    int32_t stickX = 0, stickY = 0;
+    int32_t stickX = 0, stickY = 0, rightStickX = 0, rightStickY = 0;
     uint32_t buttons = 0;
-    bool hasStick = false;
+    bool hasStick = false, hasRightStick = false;
+    bool leftTrigger = false, rightTrigger = false;
+    uint8_t hat = HAT_CENTER;
     for (int i = 0; i < count; ++i) {
         const int16_t x = points[i].x;
         const int16_t y = points[i].y;
-        if (x < 400) {
-            int32_t dx = x - 160;
-            int32_t dy = y - 264;
+        if (y >= 70 && y < 125) {
+            if (x >= 25 && x < 145) leftTrigger = true;
+            else if (x >= 145 && x < 255) buttons |= 1UL << BUTTON_TL;
+            else if (x >= 545 && x < 655) buttons |= 1UL << BUTTON_TR;
+            else if (x >= 655 && x < 780) rightTrigger = true;
+            else if (x >= 300 && x < 400) buttons |= 1UL << BUTTON_SELECT;
+            else if (x >= 400 && x < 500) buttons |= 1UL << BUTTON_START;
+        } else if (x >= 45 && x < 240 && y >= 210 && y < 410) {
+            int32_t dx = x - 142;
+            int32_t dy = y - 313;
             const int32_t radius = max(abs(dx), abs(dy));
-            if (radius > 14) {
-                stickX = constrain(dx * 127 / 110, -127, 127);
-                stickY = constrain(dy * 127 / 110, -127, 127);
+            if (radius <= 24) {
+                buttons |= 1UL << BUTTON_THUMBL;
+            } else {
+                stickX = constrain(dx * 127 / 82, -127, 127);
+                stickY = constrain(dy * 127 / 82, -127, 127);
                 hasStick = true;
             }
-        } else if (x >= 600 && x < 680 && y >= 110 && y < 190) buttons |= 1UL << BUTTON_Y;
-        else if (x >= 680 && x < 760 && y >= 180 && y < 250) buttons |= 1UL << BUTTON_X;
-        else if (x >= 600 && x < 680 && y >= 250 && y < 320) buttons |= 1UL << BUTTON_B;
-        else if (x >= 680 && x < 760 && y >= 320 && y < 390) buttons |= 1UL << BUTTON_A;
-        else if (x >= 400 && y > 410) buttons |= 1UL << (x < 600 ? BUTTON_SELECT : BUTTON_START);
+        } else if (x >= 420 && x < 615 && y >= 210 && y < 410) {
+            int32_t dx = x - 519;
+            int32_t dy = y - 313;
+            const int32_t radius = max(abs(dx), abs(dy));
+            if (radius <= 24) {
+                buttons |= 1UL << BUTTON_THUMBR;
+            } else {
+                rightStickX = constrain(dx * 127 / 82, -127, 127);
+                rightStickY = constrain(dy * 127 / 82, -127, 127);
+                hasRightStick = true;
+            }
+        } else if (x >= 245 && x < 415 && y >= 210 && y < 375) {
+            const int16_t dx = x - 330;
+            const int16_t dy = y - 292;
+            const int16_t ax = abs(dx), ay = abs(dy);
+            if (ax < 22 && ay < 22) hat = HAT_CENTER;
+            else if (ay > ax * 2) hat = dy < 0 ? HAT_UP : HAT_DOWN;
+            else if (ax > ay * 2) hat = dx < 0 ? HAT_LEFT : HAT_RIGHT;
+            else if (dx < 0 && dy < 0) hat = HAT_UP_LEFT;
+            else if (dx > 0 && dy < 0) hat = HAT_UP_RIGHT;
+            else if (dx < 0 && dy > 0) hat = HAT_DOWN_LEFT;
+            else hat = HAT_DOWN_RIGHT;
+        } else if (x >= 650 && x < 760 && y >= 205 && y < 275) buttons |= 1UL << BUTTON_Y;
+        else if (x >= 600 && x < 690 && y >= 270 && y < 335) buttons |= 1UL << BUTTON_X;
+        else if (x >= 720 && x < 800 && y >= 270 && y < 335) buttons |= 1UL << BUTTON_B;
+        else if (x >= 650 && x < 760 && y >= 330 && y < 400) buttons |= 1UL << BUTTON_A;
     }
     gamepadX = hasStick ? static_cast<int8_t>(stickX) : 0;
     gamepadY = hasStick ? static_cast<int8_t>(stickY) : 0;
+    gamepadZ = hasRightStick ? static_cast<int8_t>(rightStickX) : 0;
+    gamepadRz = hasRightStick ? static_cast<int8_t>(rightStickY) : 0;
+    gamepadLeftTrigger = leftTrigger ? 127 : 0;
+    gamepadRightTrigger = rightTrigger ? -127 : 0;
+    gamepadHat = hat;
     gamepadButtons = buttons & GAMEPAD_BUTTON_MASK;
-    tabletGamepad.send(gamepadX, gamepadY, 0, 0, 0, 0, HAT_CENTER, gamepadButtons);
+    tabletGamepad.send(gamepadX, gamepadY, gamepadZ, gamepadRz,
+                       gamepadLeftTrigger, gamepadRightTrigger, gamepadHat, gamepadButtons);
 }
 
 // GT911 has no pen identity. On multi-touch frames, prefer the point with the
@@ -411,6 +467,7 @@ void loop()
     // Require a deliberate four-contact hold, and consume that entire gesture
     // through release so its contacts cannot activate mouse or gamepad inputs.
     if (count >= 4) {
+        modeGestureLastSeenMs = now;
         modeGestureReleasePending = false;
         if (!modeGestureLatched) {
             if (!modeGesturePending) {
@@ -422,9 +479,16 @@ void loop()
                 setMode(inputMode == InputMode::Mouse ? InputMode::Gamepad : InputMode::Mouse);
             }
         }
-    } else if (count == 0) {
-        modeGesturePending = false;
-        if (modeGestureLatched) {
+    } else {
+        // readPoints() consumes controller samples that arrive at about 100 Hz,
+        // while this loop polls faster. Preserve a pending hold through those
+        // brief empty or partial frames, but cancel if four contacts stay away.
+        if (modeGesturePending && !modeGestureLatched &&
+            now - modeGestureLastSeenMs >= TOUCH_RELEASE_DEBOUNCE_MS * 2) {
+            modeGesturePending = false;
+        }
+
+        if (modeGestureLatched && count == 0) {
             if (!modeGestureReleasePending) {
                 modeGestureReleasePending = true;
                 modeGestureNoPointSinceMs = now;
@@ -432,12 +496,9 @@ void loop()
                 modeGestureLatched = false;
                 modeGestureReleasePending = false;
             }
+        } else if (modeGestureLatched) {
+            modeGestureReleasePending = false;
         }
-    } else if (!modeGestureLatched) {
-        modeGesturePending = false;
-        modeGestureReleasePending = false;
-    } else {
-        modeGestureReleasePending = false;
     }
 
     if (modeGestureLatched || count >= 4) {
@@ -455,7 +516,19 @@ void loop()
     if (inputMode == InputMode::Gamepad) {
         touchActive = false;
         touchReleasePending = false;
-        updateGamepad(points, count);
+        if (count > 0) {
+            gamepadReleasePending = false;
+            updateGamepad(points, count);
+        } else if (!gamepadReleasePending) {
+            // GT911 reports at about 100 Hz while this loop polls every 8 ms.
+            // Keep the last gamepad state across inter-report gaps so stick
+            // axes and held buttons do not flicker back to neutral.
+            gamepadReleasePending = true;
+            gamepadNoPointSinceMs = now;
+        } else if (now - gamepadNoPointSinceMs >= TOUCH_RELEASE_DEBOUNCE_MS) {
+            gamepadReleasePending = false;
+            updateGamepad(points, 0);
+        }
         return;
     }
 

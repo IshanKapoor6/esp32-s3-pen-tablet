@@ -4,6 +4,7 @@
 #include "lvgl_v8_port.h"
 #include <USB.h>
 #include <USBHIDMouse.h>
+#include <USBHIDGamepad.h>
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -19,13 +20,21 @@ static constexpr int8_t POINTER_SENSITIVITY = 3;
 static constexpr uint16_t FINGER_AREA_RATIO = 2;
 static constexpr uint16_t FINGER_AREA_MARGIN = 12;
 static constexpr uint8_t MULTITOUCH_REBASE_DELTA_PX = 48;
+static constexpr uint16_t MODE_GESTURE_HOLD_MS = 650;
 static constexpr int16_t LCD_WIDTH = 800;
 static constexpr int16_t LCD_HEIGHT = 480;
+static constexpr uint32_t GAMEPAD_BUTTON_MASK = (1UL << BUTTON_A) | (1UL << BUTTON_B) |
+    (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_SELECT) | (1UL << BUTTON_START);
 
 USBHIDMouse tabletMouse;
+USBHIDGamepad tabletGamepad;
 Board *board = nullptr;
 lv_obj_t *statusLabel = nullptr;
 lv_obj_t *touchDot = nullptr;
+lv_obj_t *mouseScreen = nullptr;
+lv_obj_t *gamepadScreen = nullptr;
+enum class InputMode : uint8_t { Mouse, Gamepad };
+InputMode inputMode = InputMode::Mouse;
 bool touchActive = false;
 bool touchMoved = false;
 bool multipleContactsSeen = false;
@@ -39,6 +48,14 @@ uint32_t lastTouchUiMs = 0;
 uint32_t neutralReportsUntilMs = 0;
 uint32_t touchNoPointSinceMs = 0;
 bool touchReleasePending = false;
+uint32_t gamepadButtons = 0;
+int8_t gamepadX = 0;
+int8_t gamepadY = 0;
+bool modeGesturePending = false;
+bool modeGestureLatched = false;
+uint32_t modeGestureStartMs = 0;
+bool modeGestureReleasePending = false;
+uint32_t modeGestureNoPointSinceMs = 0;
 
 static int8_t scaleDelta(int32_t delta)
 {
@@ -78,6 +95,7 @@ static void createTabletUi()
     lv_disp_set_theme(lv_disp_get_default(), theme);
 
     lv_obj_t *screen = lv_scr_act();
+    mouseScreen = screen;
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x111827), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
@@ -98,6 +116,94 @@ static void createTabletUi()
     lv_obj_set_style_bg_color(touchDot, lv_color_hex(0x34D399), LV_PART_MAIN);
     lv_obj_set_style_border_width(touchDot, 0, LV_PART_MAIN);
     lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
+
+    gamepadScreen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(gamepadScreen, lv_color_hex(0x111827), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(gamepadScreen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_t *gamepadTitle = lv_label_create(gamepadScreen);
+    lv_label_set_text(gamepadTitle, "CONTROLLER MODE  |  HOLD FOUR FINGERS TO SWITCH");
+    lv_obj_set_style_text_color(gamepadTitle, lv_color_hex(0xF3F4F6), LV_PART_MAIN);
+    lv_obj_align(gamepadTitle, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *stick = lv_obj_create(gamepadScreen);
+    lv_obj_set_size(stick, 220, 220);
+    lv_obj_set_style_radius(stick, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(stick, lv_color_hex(0x263449), LV_PART_MAIN);
+    lv_obj_set_style_border_color(stick, lv_color_hex(0x67E8F9), LV_PART_MAIN);
+    lv_obj_align(stick, LV_ALIGN_LEFT_MID, 50, 24);
+    lv_obj_t *stickLabel = lv_label_create(gamepadScreen);
+    lv_label_set_text(stickLabel, "LEFT STICK");
+    lv_obj_set_style_text_color(stickLabel, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
+    lv_obj_align_to(stickLabel, stick, LV_ALIGN_CENTER, 0, 0);
+
+    const char *buttonNames[] = {"Y", "X", "B", "A"};
+    const uint32_t buttonColors[] = {0x3B82F6, 0x10B981, 0xF59E0B, 0xEF4444};
+    const int16_t buttonX[] = {635, 705, 635, 705};
+    const int16_t buttonY[] = {145, 215, 285, 355};
+    for (int i = 0; i < 4; ++i) {
+        lv_obj_t *button = lv_obj_create(gamepadScreen);
+        lv_obj_set_size(button, 58, 58);
+        lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(button, lv_color_hex(buttonColors[i]), LV_PART_MAIN);
+        lv_obj_set_style_border_width(button, 0, LV_PART_MAIN);
+        lv_obj_set_pos(button, buttonX[i], buttonY[i]);
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text(label, buttonNames[i]);
+        lv_obj_center(label);
+    }
+    lv_obj_t *systemLabel = lv_label_create(gamepadScreen);
+    lv_label_set_text(systemLabel, "SELECT                         START");
+    lv_obj_set_style_text_color(systemLabel, lv_color_hex(0xD1D5DB), LV_PART_MAIN);
+    lv_obj_align(systemLabel, LV_ALIGN_BOTTOM_MID, 0, -24);
+}
+
+static void setMode(InputMode mode)
+{
+    if (inputMode == mode) return;
+    inputMode = mode;
+    touchActive = false;
+    touchReleasePending = false;
+    multipleContactsSeen = false;
+    activeContactArea = 0;
+    gamepadButtons = 0;
+    gamepadX = gamepadY = 0;
+    tabletMouse.release(MOUSE_LEFT);
+    tabletMouse.move(0, 0);
+    tabletGamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, 0);
+    if (lvgl_port_lock(1000)) {
+        lv_scr_load(mode == InputMode::Mouse ? mouseScreen : gamepadScreen);
+        lvgl_port_unlock();
+    }
+    Serial.printf("Input mode: %s\n", mode == InputMode::Mouse ? "mouse" : "gamepad");
+}
+
+static void updateGamepad(const TouchPoint points[], int count)
+{
+    int32_t stickX = 0, stickY = 0;
+    uint32_t buttons = 0;
+    bool hasStick = false;
+    for (int i = 0; i < count; ++i) {
+        const int16_t x = points[i].x;
+        const int16_t y = points[i].y;
+        if (x < 400) {
+            int32_t dx = x - 160;
+            int32_t dy = y - 264;
+            const int32_t radius = max(abs(dx), abs(dy));
+            if (radius > 14) {
+                stickX = constrain(dx * 127 / 110, -127, 127);
+                stickY = constrain(dy * 127 / 110, -127, 127);
+                hasStick = true;
+            }
+        } else if (x >= 600 && x < 680 && y >= 110 && y < 190) buttons |= 1UL << BUTTON_Y;
+        else if (x >= 680 && x < 760 && y >= 180 && y < 250) buttons |= 1UL << BUTTON_X;
+        else if (x >= 600 && x < 680 && y >= 250 && y < 320) buttons |= 1UL << BUTTON_B;
+        else if (x >= 680 && x < 760 && y >= 320 && y < 390) buttons |= 1UL << BUTTON_A;
+        else if (x >= 400 && y > 410) buttons |= 1UL << (x < 600 ? BUTTON_SELECT : BUTTON_START);
+    }
+    gamepadX = hasStick ? static_cast<int8_t>(stickX) : 0;
+    gamepadY = hasStick ? static_cast<int8_t>(stickY) : 0;
+    gamepadButtons = buttons & GAMEPAD_BUTTON_MASK;
+    tabletGamepad.send(gamepadX, gamepadY, 0, 0, 0, 0, HAT_CENTER, gamepadButtons);
 }
 
 // GT911 has no pen identity. On multi-touch frames, prefer the point with the
@@ -252,6 +358,7 @@ void setup()
     // Start USB HID only after the board/display are initialized, as the
     // Spotify project does for its board and LVGL startup.
     tabletMouse.begin();
+    tabletGamepad.begin();
     USB.begin();
     // Repeated neutral reports clear a button state the PC may have retained
     // when switching from the previous drag firmware.
@@ -274,6 +381,56 @@ void loop()
 
     TouchPoint points[TOUCH_MAX_POINTS];
     const int count = board->getTouch()->readPoints(points, TOUCH_MAX_POINTS, 0);
+
+    // Require a deliberate four-contact hold, and consume that entire gesture
+    // through release so its contacts cannot activate mouse or gamepad inputs.
+    if (count >= 4) {
+        modeGestureReleasePending = false;
+        if (!modeGestureLatched) {
+            if (!modeGesturePending) {
+                modeGesturePending = true;
+                modeGestureStartMs = now;
+            } else if (now - modeGestureStartMs >= MODE_GESTURE_HOLD_MS) {
+                modeGestureLatched = true;
+                modeGesturePending = false;
+                setMode(inputMode == InputMode::Mouse ? InputMode::Gamepad : InputMode::Mouse);
+            }
+        }
+    } else if (count == 0) {
+        modeGesturePending = false;
+        if (modeGestureLatched) {
+            if (!modeGestureReleasePending) {
+                modeGestureReleasePending = true;
+                modeGestureNoPointSinceMs = now;
+            } else if (now - modeGestureNoPointSinceMs >= TOUCH_RELEASE_DEBOUNCE_MS) {
+                modeGestureLatched = false;
+                modeGestureReleasePending = false;
+            }
+        }
+    } else if (!modeGestureLatched) {
+        modeGesturePending = false;
+        modeGestureReleasePending = false;
+    } else {
+        modeGestureReleasePending = false;
+    }
+
+    if (modeGestureLatched || count >= 4) {
+        if (inputMode == InputMode::Gamepad) {
+            gamepadX = gamepadY = 0;
+            gamepadButtons = 0;
+            tabletGamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, 0);
+        }
+        if (touchActive) endTouch();
+        return;
+    }
+
+    if (inputMode == InputMode::Gamepad) {
+        touchActive = false;
+        touchReleasePending = false;
+        updateGamepad(points, count);
+        return;
+    }
+
     TouchPoint point;
     const bool hasPointerContact = selectPointerContact(points, count, point);
     if (hasPointerContact) {

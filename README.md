@@ -15,6 +15,14 @@ The display shows a dark diagnostic screen. It says **WAITING FOR TOUCH** until 
 - Sensitivity is set to 3x the raw touch movement.
 - With multiple contacts, the smallest reported GT911 contact area is used as a stylus proxy; much larger remaining contacts are ignored until all contacts lift.
 - A finger or capacitive stylus works. Passive plastic pens do not. No pressure or tilt data is available.
+- Hold four contacts for about 0.65 seconds to switch between mouse and controller modes. The switching gesture is ignored as input until the contacts lift.
+
+## Controller behavior
+
+- In controller mode, touch the left side of the screen to move the USB HID gamepad's left stick.
+- Touch the colored Y, X, B, and A areas on the right to hold those buttons. The lower edge maps to Select and Start.
+- Multiple contacts can operate the stick and buttons at the same time. Releasing a contact releases its gamepad input.
+- Hold four contacts again for about 0.65 seconds to return to mouse mode.
 
 The GT911 does not identify an active pen separately from a finger. Multi-touch rejection is therefore an area-size heuristic: a broad-tipped capacitive stylus may not separate cleanly from fingers, and a single finger touch is accepted as normal input.
 
@@ -32,7 +40,7 @@ Install the libraries used by the Spotify display project:
 - `ESP32_IO_Expander`
 - `lvgl` (v8.4.x)
 
-The ESP32 Arduino core provides `USBHIDMouse.h`. Select **ESP32S3 Dev Module**:
+The ESP32 Arduino core provides `USBHIDMouse.h` and `USBHIDGamepad.h`. Select **ESP32S3 Dev Module**:
 
 | Setting | Value |
 |---|---|

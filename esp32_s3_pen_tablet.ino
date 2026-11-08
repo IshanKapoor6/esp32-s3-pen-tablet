@@ -33,6 +33,7 @@ lv_obj_t *statusLabel = nullptr;
 lv_obj_t *touchDot = nullptr;
 lv_obj_t *mouseScreen = nullptr;
 lv_obj_t *gamepadScreen = nullptr;
+lv_obj_t *gamepadGestureLabel = nullptr;
 enum class InputMode : uint8_t { Mouse, Gamepad };
 InputMode inputMode = InputMode::Mouse;
 bool touchActive = false;
@@ -56,6 +57,7 @@ bool modeGestureLatched = false;
 uint32_t modeGestureStartMs = 0;
 bool modeGestureReleasePending = false;
 uint32_t modeGestureNoPointSinceMs = 0;
+uint32_t lastGestureUiMs = 0;
 
 static int8_t scaleDelta(int32_t delta)
 {
@@ -124,6 +126,10 @@ static void createTabletUi()
     lv_label_set_text(gamepadTitle, "CONTROLLER MODE  |  HOLD FOUR FINGERS TO SWITCH");
     lv_obj_set_style_text_color(gamepadTitle, lv_color_hex(0xF3F4F6), LV_PART_MAIN);
     lv_obj_align(gamepadTitle, LV_ALIGN_TOP_MID, 0, 22);
+    gamepadGestureLabel = lv_label_create(gamepadScreen);
+    lv_label_set_text(gamepadGestureLabel, "Touch the left side for stick, right side for buttons");
+    lv_obj_set_style_text_color(gamepadGestureLabel, lv_color_hex(0x67E8F9), LV_PART_MAIN);
+    lv_obj_align(gamepadGestureLabel, LV_ALIGN_TOP_MID, 0, 58);
 
     lv_obj_t *stick = lv_obj_create(gamepadScreen);
     lv_obj_set_size(stick, 220, 220);
@@ -155,6 +161,26 @@ static void createTabletUi()
     lv_label_set_text(systemLabel, "SELECT                         START");
     lv_obj_set_style_text_color(systemLabel, lv_color_hex(0xD1D5DB), LV_PART_MAIN);
     lv_obj_align(systemLabel, LV_ALIGN_BOTTOM_MID, 0, -24);
+}
+
+static void setGestureDisplay(int count, uint32_t heldMs)
+{
+    const uint32_t now = millis();
+    if (lastGestureUiMs != 0 && now - lastGestureUiMs < 100) return;
+    lastGestureUiMs = now;
+    if (!lvgl_port_lock(1000)) return;
+
+    char message[96];
+    snprintf(message, sizeof(message), "TOUCH CONTACTS: %d\nHold four to switch: %.1f / 0.7 sec",
+             count, heldMs / 1000.0f);
+    if (inputMode == InputMode::Mouse) {
+        lv_label_set_text(statusLabel, message);
+        lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
+    } else if (gamepadGestureLabel != nullptr) {
+        lv_label_set_text(gamepadGestureLabel, message);
+    }
+
+    lvgl_port_unlock();
 }
 
 static void setMode(InputMode mode)
@@ -415,12 +441,14 @@ void loop()
     }
 
     if (modeGestureLatched || count >= 4) {
+        if (touchActive) endTouch();
+        const uint32_t heldMs = modeGesturePending ? now - modeGestureStartMs : MODE_GESTURE_HOLD_MS;
+        setGestureDisplay(count, heldMs);
         if (inputMode == InputMode::Gamepad) {
             gamepadX = gamepadY = 0;
             gamepadButtons = 0;
             tabletGamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, 0);
         }
-        if (touchActive) endTouch();
         return;
     }
 

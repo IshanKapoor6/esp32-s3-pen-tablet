@@ -2,9 +2,11 @@
 
 Turn a Waveshare ESP32-S3-Touch-LCD-4.3B into a USB HID mousepad for a PC. The project reuses the board setup and LVGL display port from the Desktop `spotify_esp32_display` project and reads the GT911 capacitive touchscreen.
 
-## What the screen shows
+## Mouse mode screen
 
-The display shows a dark diagnostic screen. It says **WAITING FOR TOUCH** until the touch controller reports a point, then displays **TOUCH DETECTED** with X/Y coordinates and a dot at that position. This is useful for checking touch independent of PC mouse movement.
+Mouse mode displays a full-screen 800x480 still captured from the rendered Wallpaper Engine scene supplied with the project. The image is embedded in the firmware and decoded into PSRAM at startup; no status text or touch marker is drawn over it.
+
+You can switch to another wallpaper: replace `wallpaper_still.jpg` with an 800x480 JPEG, then run `python tools/embed_wallpaper.py` to regenerate `wallpaper_image.h`. Rebuild and upload the sketch to use the replacement.
 
 ## Mouse behavior
 
@@ -19,8 +21,8 @@ The display shows a dark diagnostic screen. It says **WAITING FOR TOUCH** until 
 
 ## Controller behavior
 
-- In controller mode, touch the left side of the screen to move the USB HID gamepad's left stick.
-- Touch the colored Y, X, B, and A areas on the right to hold those buttons. The lower edge maps to Select and Start.
+- In controller mode, drag on either stick to move that USB HID gamepad axis. The stick finger remains tracked after it leaves the drawn circle, and the output clamps at full deflection.
+- The screen also maps the D-pad, A/B/X/Y, LB/RB, LT/RT, Select/Start, and stick clicks.
 - Multiple contacts can operate the stick and buttons at the same time. Releasing a contact releases its gamepad input.
 - Hold four contacts again for about 0.65 seconds to return to mouse mode.
 
@@ -39,6 +41,7 @@ Install the libraries used by the Spotify display project:
 - `esp-lib-utils`
 - `ESP32_IO_Expander`
 - `lvgl` (v8.4.x)
+- `TJpg_Decoder`
 
 The ESP32 Arduino core provides `USBHIDMouse.h` and `USBHIDGamepad.h`. Select **ESP32S3 Dev Module**:
 

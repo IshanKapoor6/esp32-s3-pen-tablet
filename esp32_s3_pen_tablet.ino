@@ -5,6 +5,9 @@
 #include <USB.h>
 #include <USBHIDMouse.h>
 #include <USBHIDGamepad.h>
+#include <TJpg_Decoder.h>
+#include <esp_heap_caps.h>
+#include "wallpaper_image.h"
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -36,6 +39,10 @@ lv_obj_t *touchDot = nullptr;
 lv_obj_t *mouseScreen = nullptr;
 lv_obj_t *gamepadScreen = nullptr;
 lv_obj_t *gamepadGestureLabel = nullptr;
+lv_obj_t *wallpaperObject = nullptr;
+static uint16_t *wallpaperPixels = nullptr;
+static lv_img_dsc_t wallpaperImage = {};
+bool wallpaperActive = false;
 enum class InputMode : uint8_t { Mouse, Gamepad };
 InputMode inputMode = InputMode::Mouse;
 bool touchActive = false;
@@ -61,6 +68,12 @@ int8_t gamepadRightTrigger = 0;
 uint8_t gamepadHat = HAT_CENTER;
 bool gamepadReleasePending = false;
 uint32_t gamepadNoPointSinceMs = 0;
+bool leftStickTouchActive = false;
+bool rightStickTouchActive = false;
+int16_t leftStickLastX = 0;
+int16_t leftStickLastY = 0;
+int16_t rightStickLastX = 0;
+int16_t rightStickLastY = 0;
 bool modeGesturePending = false;
 bool modeGestureLatched = false;
 uint32_t modeGestureStartMs = 0;
@@ -77,8 +90,53 @@ static int8_t scaleDelta(int32_t delta)
     return static_cast<int8_t>(scaled);
 }
 
+static bool wallpaperJpegOutput(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t *pixels)
+{
+    if (wallpaperPixels == nullptr || x < 0 || y < 0 || x + width > LCD_WIDTH || y + height > LCD_HEIGHT) {
+        return false;
+    }
+    for (uint16_t row = 0; row < height; ++row) {
+        memcpy(wallpaperPixels + (static_cast<size_t>(y + row) * LCD_WIDTH) + x,
+               pixels + (static_cast<size_t>(row) * width),
+               static_cast<size_t>(width) * sizeof(uint16_t));
+    }
+    return true;
+}
+
+static bool loadWallpaperImage()
+{
+    wallpaperPixels = static_cast<uint16_t *>(heap_caps_malloc(
+        static_cast<size_t>(LCD_WIDTH) * LCD_HEIGHT * sizeof(uint16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (wallpaperPixels == nullptr) {
+        Serial.println("Wallpaper image: PSRAM allocation failed");
+        return false;
+    }
+
+    TJpgDec.setCallback(wallpaperJpegOutput);
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setSwapBytes(false);
+    if (TJpgDec.drawJpg(0, 0, wallpaperJpg, wallpaperJpgLength) != JDR_OK) {
+        Serial.println("Wallpaper image: JPEG decode failed");
+        heap_caps_free(wallpaperPixels);
+        wallpaperPixels = nullptr;
+        return false;
+    }
+
+    wallpaperImage.header.cf = LV_IMG_CF_TRUE_COLOR;
+    wallpaperImage.header.always_zero = 0;
+    wallpaperImage.header.w = LCD_WIDTH;
+    wallpaperImage.header.h = LCD_HEIGHT;
+    wallpaperImage.data_size = static_cast<uint32_t>(LCD_WIDTH) * LCD_HEIGHT * sizeof(uint16_t);
+    wallpaperImage.data = reinterpret_cast<const uint8_t *>(wallpaperPixels);
+    wallpaperActive = true;
+    Serial.printf("Wallpaper image loaded (%u bytes JPEG)\n", wallpaperJpgLength);
+    return true;
+}
+
 static void setTouchDisplay(bool touched, int16_t x = 0, int16_t y = 0, int count = 0, int area = 0)
 {
+    if (wallpaperActive) return;
     if (statusLabel == nullptr || touchDot == nullptr) return;
     if (!lvgl_port_lock(1000)) return;
 
@@ -111,16 +169,24 @@ static void createTabletUi()
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x111827), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
+    if (wallpaperActive) {
+        wallpaperObject = lv_img_create(screen);
+        lv_img_set_src(wallpaperObject, &wallpaperImage);
+        lv_obj_set_pos(wallpaperObject, 0, 0);
+    }
+
     lv_obj_t *title = lv_label_create(screen);
     lv_label_set_text(title, "ESP32-S3 PEN TABLET");
     lv_obj_set_style_text_color(title, lv_color_hex(0xF3F4F6), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 28);
+    if (wallpaperActive) lv_obj_add_flag(title, LV_OBJ_FLAG_HIDDEN);
 
     statusLabel = lv_label_create(screen);
     lv_label_set_text(statusLabel, "WAITING FOR TOUCH\nTouch the screen to test the GT911 sensor");
     lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x67E8F9), LV_PART_MAIN);
     lv_obj_set_style_text_align(statusLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_align(statusLabel, LV_ALIGN_CENTER, 0, 0);
+    if (wallpaperActive) lv_obj_add_flag(statusLabel, LV_OBJ_FLAG_HIDDEN);
 
     touchDot = lv_obj_create(screen);
     lv_obj_set_size(touchDot, 32, 32);
@@ -211,6 +277,8 @@ static void setMode(InputMode mode)
     gamepadLeftTrigger = gamepadRightTrigger = 0;
     gamepadHat = HAT_CENTER;
     gamepadReleasePending = false;
+    leftStickTouchActive = false;
+    rightStickTouchActive = false;
     tabletMouse.release(MOUSE_LEFT);
     tabletMouse.move(0, 0);
     tabletGamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, 0);
@@ -228,7 +296,92 @@ static void updateGamepad(const TouchPoint points[], int count)
     bool hasStick = false, hasRightStick = false;
     bool leftTrigger = false, rightTrigger = false;
     uint8_t hat = HAT_CENTER;
+
+    // The GT911 API does not expose contact IDs, so keep each virtual stick
+    // attached to the nearest point from its previous sample. A finger that
+    // starts on a stick remains captured even after leaving the drawn circle.
+    int leftStickPoint = -1;
+    int rightStickPoint = -1;
+    bool pointUsed[TOUCH_MAX_POINTS] = {};
+    const auto findTrackedPoint = [&](int16_t lastX, int16_t lastY) {
+        int best = -1;
+        int32_t bestDistance = 250 * 250;
+        for (int i = 0; i < count; ++i) {
+            if (pointUsed[i]) continue;
+            const int32_t dx = points[i].x - lastX;
+            const int32_t dy = points[i].y - lastY;
+            const int32_t distance = dx * dx + dy * dy;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        return best;
+    };
+
+    if (leftStickTouchActive) {
+        leftStickPoint = findTrackedPoint(leftStickLastX, leftStickLastY);
+        if (leftStickPoint >= 0) pointUsed[leftStickPoint] = true;
+        else leftStickTouchActive = false;
+    }
+    if (rightStickTouchActive) {
+        rightStickPoint = findTrackedPoint(rightStickLastX, rightStickLastY);
+        if (rightStickPoint >= 0) pointUsed[rightStickPoint] = true;
+        else rightStickTouchActive = false;
+    }
+
+    // New stick contacts start anywhere within the visible circular zones.
+    // Captured contacts are then allowed to travel beyond those zones.
     for (int i = 0; i < count; ++i) {
+        if (pointUsed[i]) continue;
+        const int32_t lx = points[i].x - 142;
+        const int32_t ly = points[i].y - 313;
+        if (!leftStickTouchActive && lx * lx + ly * ly <= 96 * 96) {
+            leftStickTouchActive = true;
+            leftStickPoint = i;
+            leftStickLastX = points[i].x;
+            leftStickLastY = points[i].y;
+            pointUsed[i] = true;
+            continue;
+        }
+        const int32_t rx = points[i].x - 519;
+        const int32_t ry = points[i].y - 313;
+        if (!rightStickTouchActive && rx * rx + ry * ry <= 96 * 96) {
+            rightStickTouchActive = true;
+            rightStickPoint = i;
+            rightStickLastX = points[i].x;
+            rightStickLastY = points[i].y;
+            pointUsed[i] = true;
+        }
+    }
+
+    if (leftStickPoint >= 0) {
+        leftStickLastX = points[leftStickPoint].x;
+        leftStickLastY = points[leftStickPoint].y;
+        const int32_t dx = leftStickLastX - 142;
+        const int32_t dy = leftStickLastY - 313;
+        if (max(abs(dx), abs(dy)) <= 24) buttons |= 1UL << BUTTON_THUMBL;
+        else {
+            stickX = constrain(dx * 127 / 82, -127, 127);
+            stickY = constrain(dy * 127 / 82, -127, 127);
+            hasStick = true;
+        }
+    }
+    if (rightStickPoint >= 0) {
+        rightStickLastX = points[rightStickPoint].x;
+        rightStickLastY = points[rightStickPoint].y;
+        const int32_t dx = rightStickLastX - 519;
+        const int32_t dy = rightStickLastY - 313;
+        if (max(abs(dx), abs(dy)) <= 24) buttons |= 1UL << BUTTON_THUMBR;
+        else {
+            rightStickX = constrain(dx * 127 / 82, -127, 127);
+            rightStickY = constrain(dy * 127 / 82, -127, 127);
+            hasRightStick = true;
+        }
+    }
+
+    for (int i = 0; i < count; ++i) {
+        if (pointUsed[i]) continue;
         const int16_t x = points[i].x;
         const int16_t y = points[i].y;
         if (y >= 70 && y < 125) {
@@ -238,28 +391,6 @@ static void updateGamepad(const TouchPoint points[], int count)
             else if (x >= 655 && x < 780) rightTrigger = true;
             else if (x >= 300 && x < 400) buttons |= 1UL << BUTTON_SELECT;
             else if (x >= 400 && x < 500) buttons |= 1UL << BUTTON_START;
-        } else if (x >= 45 && x < 240 && y >= 210 && y < 410) {
-            int32_t dx = x - 142;
-            int32_t dy = y - 313;
-            const int32_t radius = max(abs(dx), abs(dy));
-            if (radius <= 24) {
-                buttons |= 1UL << BUTTON_THUMBL;
-            } else {
-                stickX = constrain(dx * 127 / 82, -127, 127);
-                stickY = constrain(dy * 127 / 82, -127, 127);
-                hasStick = true;
-            }
-        } else if (x >= 420 && x < 615 && y >= 210 && y < 410) {
-            int32_t dx = x - 519;
-            int32_t dy = y - 313;
-            const int32_t radius = max(abs(dx), abs(dy));
-            if (radius <= 24) {
-                buttons |= 1UL << BUTTON_THUMBR;
-            } else {
-                rightStickX = constrain(dx * 127 / 82, -127, 127);
-                rightStickY = constrain(dy * 127 / 82, -127, 127);
-                hasRightStick = true;
-            }
         } else if (x >= 245 && x < 415 && y >= 210 && y < 375) {
             const int16_t dx = x - 330;
             const int16_t dy = y - 292;
@@ -433,6 +564,7 @@ void setup()
         Serial.println("ERROR: LVGL display initialization failed");
         while (true) delay(1000);
     }
+    loadWallpaperImage();
     lvgl_port_lock(-1);
     createTabletUi();
     lvgl_port_unlock();
